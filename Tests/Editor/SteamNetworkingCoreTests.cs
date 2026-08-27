@@ -18,7 +18,8 @@ namespace DingoSteamNetworking.Tests.Editor
                 6,
                 12,
                 4096,
-                32);
+                32,
+                new[] { 4, 12, 27 });
 
             Assert.That(configuration.ProductId, Is.EqualTo("politics"));
             Assert.That(configuration.ProtocolVersion, Is.EqualTo(3));
@@ -26,6 +27,9 @@ namespace DingoSteamNetworking.Tests.Editor
             Assert.That(configuration.BuildId, Is.EqualTo("dev-build"));
             Assert.That(configuration.LobbyMemberLimit, Is.EqualTo(6));
             Assert.That(configuration.MessageChannel, Is.EqualTo(12));
+            Assert.That(configuration.MessageChannels, Is.EqualTo(new[] { 12, 4, 27 }));
+            Assert.That(configuration.HasMessageChannel(27), Is.True);
+            Assert.That(configuration.HasMessageChannel(99), Is.False);
             Assert.That(configuration.MaxPayloadBytes, Is.EqualTo(4096));
             Assert.That(configuration.MaxMessagesPerTick, Is.EqualTo(32));
         }
@@ -52,6 +56,12 @@ namespace DingoSteamNetworking.Tests.Editor
                 new SteamNetworkingConfiguration("politics", 1, "build", maxPayloadBytes: 0));
             Assert.Throws<ArgumentOutOfRangeException>(() =>
                 new SteamNetworkingConfiguration("politics", 1, "build", maxMessagesPerTick: 0));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                new SteamNetworkingConfiguration(
+                    "politics",
+                    1,
+                    "build",
+                    additionalMessageChannels: new[] { -1 }));
         }
 
         [Test]

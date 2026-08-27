@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Globalization;
 
 namespace DingoSteamNetworking
@@ -15,6 +17,7 @@ namespace DingoSteamNetworking
         public readonly string BuildId;
         public readonly int LobbyMemberLimit;
         public readonly int MessageChannel;
+        public readonly ReadOnlyCollection<int> MessageChannels;
         public readonly int MaxPayloadBytes;
         public readonly int MaxMessagesPerTick;
 
@@ -27,7 +30,8 @@ namespace DingoSteamNetworking
             int lobbyMemberLimit = DEFAULT_LOBBY_MEMBER_LIMIT,
             int messageChannel = DEFAULT_MESSAGE_CHANNEL,
             int maxPayloadBytes = DEFAULT_MAX_PAYLOAD_BYTES,
-            int maxMessagesPerTick = DEFAULT_MAX_MESSAGES_PER_TICK)
+            int maxMessagesPerTick = DEFAULT_MAX_MESSAGES_PER_TICK,
+            IReadOnlyList<int> additionalMessageChannels = null)
         {
             if (string.IsNullOrWhiteSpace(productId))
                 throw new ArgumentException("Product ID is required.", nameof(productId));
@@ -56,13 +60,39 @@ namespace DingoSteamNetworking
                     "Messages per tick must be between 1 and 1024.");
             }
 
+            var channels = new List<int> { messageChannel };
+            if (additionalMessageChannels != null)
+            {
+                for (var i = 0; i < additionalMessageChannels.Count; i++)
+                {
+                    var channel = additionalMessageChannels[i];
+                    if (channel < 0)
+                    {
+                        throw new ArgumentOutOfRangeException(
+                            nameof(additionalMessageChannels),
+                            "Message channels cannot be negative.");
+                    }
+
+                    if (!channels.Contains(channel))
+                    {
+                        channels.Add(channel);
+                    }
+                }
+            }
+
             ProductId = productId;
             ProtocolVersion = protocolVersion;
             BuildId = buildId;
             LobbyMemberLimit = lobbyMemberLimit;
             MessageChannel = messageChannel;
+            MessageChannels = channels.AsReadOnly();
             MaxPayloadBytes = maxPayloadBytes;
             MaxMessagesPerTick = maxMessagesPerTick;
+        }
+
+        public bool HasMessageChannel(int channel)
+        {
+            return MessageChannels.Contains(channel);
         }
     }
 }

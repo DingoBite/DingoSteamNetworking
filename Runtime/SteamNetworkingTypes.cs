@@ -236,13 +236,24 @@ namespace DingoSteamNetworking
         private readonly byte[] _payload;
 
         public readonly SteamPeerId SenderId;
+        public readonly int Channel;
         public readonly byte MessageKind;
 
         public ReadOnlyMemory<byte> Payload => _payload;
 
         public SteamPeerMessage(SteamPeerId senderId, byte messageKind, byte[] payload)
+            : this(senderId, 0, messageKind, payload)
+        {
+        }
+
+        public SteamPeerMessage(
+            SteamPeerId senderId,
+            int channel,
+            byte messageKind,
+            byte[] payload)
         {
             SenderId = senderId;
+            Channel = channel;
             MessageKind = messageKind;
             _payload = new byte[payload.Length];
             Buffer.BlockCopy(payload, 0, _payload, 0, payload.Length);

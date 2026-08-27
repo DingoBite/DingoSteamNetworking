@@ -21,6 +21,7 @@ namespace DingoSteamNetworking
         private bool _steamInitialized;
         private CSteamID _activeLobbyId;
         private IntPtr[] _receivePointers;
+        private int _nextReceiveChannelIndex;
 
         private Callback<GameLobbyJoinRequested_t> _joinRequestedCallback;
         private Callback<LobbyChatUpdate_t> _lobbyChatUpdateCallback;
@@ -204,9 +205,68 @@ namespace DingoSteamNetworking
             byte messageKind,
             ReadOnlySpan<byte> payload)
         {
+            return Send(
+                peerId,
+                _configuration?.MessageChannel
+                ?? SteamNetworkingConfiguration.DEFAULT_MESSAGE_CHANNEL,
+                messageKind,
+                payload,
+                Constants.k_nSteamNetworkingSend_ReliableNoNagle);
+        }
+
+        public SteamPeerSendResult SendUnreliableNoDelay(
+            SteamPeerId peerId,
+            int channel,
+            byte messageKind,
+            ReadOnlySpan<byte> payload)
+        {
+            return Send(
+                peerId,
+                channel,
+                messageKind,
+                payload,
+                Constants.k_nSteamNetworkingSend_UnreliableNoDelay);
+        }
+
+        public SteamBroadcastResult BroadcastReliable(byte messageKind, ReadOnlySpan<byte> payload)
+        {
+            return Broadcast(
+                _configuration?.MessageChannel
+                ?? SteamNetworkingConfiguration.DEFAULT_MESSAGE_CHANNEL,
+                messageKind,
+                payload,
+                Constants.k_nSteamNetworkingSend_ReliableNoNagle);
+        }
+
+        public SteamBroadcastResult BroadcastUnreliableNoDelay(
+            int channel,
+            byte messageKind,
+            ReadOnlySpan<byte> payload)
+        {
+            return Broadcast(
+                channel,
+                messageKind,
+                payload,
+                Constants.k_nSteamNetworkingSend_UnreliableNoDelay);
+        }
+
+        private SteamPeerSendResult Send(
+            SteamPeerId peerId,
+            int channel,
+            byte messageKind,
+            ReadOnlySpan<byte> payload,
+            int sendFlags)
+        {
             var validation = ValidateCommandState(SteamNetworkingState.InLobby);
             if (!validation.Accepted)
                 return FailedPeerSend(peerId, validation.Error.Code, validation.Error.Message);
+            if (!_configuration.HasMessageChannel(channel))
+            {
+                return FailedPeerSend(
+                    peerId,
+                    SteamNetworkingErrorCode.InvalidPayload,
+                    $"Message channel {channel} is not configured for this client.");
+            }
             if (!_membership.Contains(peerId) || peerId == LocalPeer.Id)
             {
                 return FailedPeerSend(
@@ -237,8 +297,8 @@ namespace DingoSteamNetworking
                     ref identity,
                     pinnedPacket.AddrOfPinnedObject(),
                     (uint)packet.Length,
-                    Constants.k_nSteamNetworkingSend_ReliableNoNagle,
-                    _configuration.MessageChannel);
+                    sendFlags,
+                    channel);
 
                 if (sendResult == EResult.k_EResultNoConnection)
                 {
@@ -246,9 +306,9 @@ namespace DingoSteamNetworking
                         ref identity,
                         pinnedPacket.AddrOfPinnedObject(),
                         (uint)packet.Length,
-                        Constants.k_nSteamNetworkingSend_ReliableNoNagle
+                        sendFlags
                         | Constants.k_nSteamNetworkingSend_AutoRestartBrokenSession,
-                        _configuration.MessageChannel);
+                        channel);
                 }
 
                 if (sendResult == EResult.k_EResultOK)
@@ -265,7 +325,11 @@ namespace DingoSteamNetworking
             }
         }
 
-        public SteamBroadcastResult BroadcastReliable(byte messageKind, ReadOnlySpan<byte> payload)
+        private SteamBroadcastResult Broadcast(
+            int channel,
+            byte messageKind,
+            ReadOnlySpan<byte> payload,
+            int sendFlags)
         {
             var validation = ValidateCommandState(SteamNetworkingState.InLobby);
             if (!validation.Accepted)
@@ -273,6 +337,14 @@ namespace DingoSteamNetworking
                 return new SteamBroadcastResult(
                     Array.Empty<SteamPeerSendResult>(),
                     validation.Error);
+            }
+            if (!_configuration.HasMessageChannel(channel))
+            {
+                return new SteamBroadcastResult(
+                    Array.Empty<SteamPeerSendResult>(),
+                    new SteamNetworkingError(
+                        SteamNetworkingErrorCode.InvalidPayload,
+                        $"Message channel {channel} is not configured for this client."));
             }
             if (!SteamMessageEnvelopeCodec.TryEncode(
                     _configuration.ProtocolVersion,
@@ -294,7 +366,14 @@ namespace DingoSteamNetworking
             {
                 var peer = CurrentLobby.Members[i];
                 if (!peer.IsLocal)
-                    results.Add(SendReliable(peer.Id, messageKind, payload));
+                {
+                    results.Add(Send(
+                        peer.Id,
+                        channel,
+                        messageKind,
+                        payload,
+                        sendFlags));
+                }
             }
 
             return new SteamBroadcastResult(results);
@@ -319,6 +398,7 @@ namespace DingoSteamNetworking
             LocalPeer = null;
             _configuration = null;
             _receivePointers = null;
+            _nextReceiveChannelIndex = 0;
             _lifecycleOwner = null;
             SetState(SteamNetworkingState.Uninitialized);
         }
@@ -574,26 +654,38 @@ namespace DingoSteamNetworking
             if (State != SteamNetworkingState.InLobby)
                 return;
 
-            var receivedCount = SteamNetworkingMessages.ReceiveMessagesOnChannel(
-                _configuration.MessageChannel,
-                _receivePointers,
-                _receivePointers.Length);
-            for (var i = 0; i < receivedCount; i++)
+            var channels = _configuration.MessageChannels;
+            var startIndex = _nextReceiveChannelIndex % channels.Count;
+            var remaining = _receivePointers.Length;
+            for (var offset = 0; offset < channels.Count && remaining > 0; offset++)
             {
-                var messagePointer = _receivePointers[i];
-                try
+                var channelIndex = (startIndex + offset) % channels.Count;
+                var channel = channels[channelIndex];
+                var receivedCount = SteamNetworkingMessages.ReceiveMessagesOnChannel(
+                    channel,
+                    _receivePointers,
+                    remaining);
+                for (var i = 0; i < receivedCount; i++)
                 {
-                    ReceiveMessage(messagePointer);
+                    var messagePointer = _receivePointers[i];
+                    try
+                    {
+                        ReceiveMessage(channel, messagePointer);
+                    }
+                    finally
+                    {
+                        SteamNetworkingMessage_t.Release(messagePointer);
+                        _receivePointers[i] = IntPtr.Zero;
+                    }
                 }
-                finally
-                {
-                    SteamNetworkingMessage_t.Release(messagePointer);
-                    _receivePointers[i] = IntPtr.Zero;
-                }
+
+                remaining -= receivedCount;
             }
+
+            _nextReceiveChannelIndex = (startIndex + 1) % channels.Count;
         }
 
-        private void ReceiveMessage(IntPtr messagePointer)
+        private void ReceiveMessage(int channel, IntPtr messagePointer)
         {
             var message = SteamNetworkingMessage_t.FromIntPtr(messagePointer);
             var senderId = new SteamPeerId(message.m_identityPeer.GetSteamID64());
@@ -628,7 +720,11 @@ namespace DingoSteamNetworking
                 return;
             }
 
-            MessageReceived?.Invoke(new SteamPeerMessage(senderId, messageKind, payload));
+            MessageReceived?.Invoke(new SteamPeerMessage(
+                senderId,
+                channel,
+                messageKind,
+                payload));
         }
 
         private void ClearActiveLobby(bool notifySteam, bool setReadyState)
