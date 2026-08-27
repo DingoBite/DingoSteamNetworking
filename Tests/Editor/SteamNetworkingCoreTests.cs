@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using NUnit.Framework;
 
 namespace DingoSteamNetworking.Tests.Editor
@@ -62,6 +63,37 @@ namespace DingoSteamNetworking.Tests.Editor
                     1,
                     "build",
                     additionalMessageChannels: new[] { -1 }));
+        }
+
+        [Test]
+        public void ReceivePointerBuffer_MatchesRequestedCapacityAndIsReused()
+        {
+            var client = new SteamNetworkingClient();
+            var clientType = typeof(SteamNetworkingClient);
+            var buffersField = clientType.GetField(
+                "_receivePointerBuffers",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            var getBufferMethod = clientType.GetMethod(
+                "GetReceivePointerBuffer",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+
+            Assert.That(buffersField, Is.Not.Null);
+            Assert.That(getBufferMethod, Is.Not.Null);
+            buffersField.SetValue(client, new IntPtr[65][]);
+
+            var fullBuffer = (IntPtr[])getBufferMethod.Invoke(
+                client,
+                new object[] { 64 });
+            var reducedBuffer = (IntPtr[])getBufferMethod.Invoke(
+                client,
+                new object[] { 61 });
+            var reusedReducedBuffer = (IntPtr[])getBufferMethod.Invoke(
+                client,
+                new object[] { 61 });
+
+            Assert.That(fullBuffer.Length, Is.EqualTo(64));
+            Assert.That(reducedBuffer.Length, Is.EqualTo(61));
+            Assert.That(reusedReducedBuffer, Is.SameAs(reducedBuffer));
         }
 
         [Test]
