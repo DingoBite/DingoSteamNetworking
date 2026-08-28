@@ -42,6 +42,8 @@ namespace DingoSteamNetworking
         public event Action<SteamLobbyId> LobbyJoinRequested;
         public event Action<SteamPeerMessage> MessageReceived;
         public event Action<SteamNetworkingError> ErrorRaised;
+        public event Action<SteamPeerId, SteamNetworkingError>
+            PeerSessionFailed;
 
         public SteamCommandResult Initialize(SteamNetworkingConfiguration configuration)
         {
@@ -214,7 +216,25 @@ namespace DingoSteamNetworking
                 ?? SteamNetworkingConfiguration.DEFAULT_MESSAGE_CHANNEL,
                 messageKind,
                 payload,
-                Constants.k_nSteamNetworkingSend_ReliableNoNagle);
+                Constants.k_nSteamNetworkingSend_ReliableNoNagle,
+                allowSessionRestart: true,
+                ignoredIsSuccess: false);
+        }
+
+        public SteamPeerSendResult SendReliableNoSessionRestart(
+            SteamPeerId peerId,
+            byte messageKind,
+            ReadOnlySpan<byte> payload)
+        {
+            return Send(
+                peerId,
+                _configuration?.MessageChannel
+                ?? SteamNetworkingConfiguration.DEFAULT_MESSAGE_CHANNEL,
+                messageKind,
+                payload,
+                Constants.k_nSteamNetworkingSend_ReliableNoNagle,
+                allowSessionRestart: false,
+                ignoredIsSuccess: false);
         }
 
         public SteamPeerSendResult SendUnreliableNoDelay(
@@ -228,7 +248,25 @@ namespace DingoSteamNetworking
                 channel,
                 messageKind,
                 payload,
-                Constants.k_nSteamNetworkingSend_UnreliableNoDelay);
+                Constants.k_nSteamNetworkingSend_UnreliableNoDelay,
+                allowSessionRestart: true,
+                ignoredIsSuccess: true);
+        }
+
+        public SteamPeerSendResult SendUnreliableNoDelayNoSessionRestart(
+            SteamPeerId peerId,
+            int channel,
+            byte messageKind,
+            ReadOnlySpan<byte> payload)
+        {
+            return Send(
+                peerId,
+                channel,
+                messageKind,
+                payload,
+                Constants.k_nSteamNetworkingSend_UnreliableNoDelay,
+                allowSessionRestart: false,
+                ignoredIsSuccess: true);
         }
 
         public SteamBroadcastResult BroadcastReliable(byte messageKind, ReadOnlySpan<byte> payload)
@@ -258,7 +296,9 @@ namespace DingoSteamNetworking
             int channel,
             byte messageKind,
             ReadOnlySpan<byte> payload,
-            int sendFlags)
+            int sendFlags,
+            bool allowSessionRestart,
+            bool ignoredIsSuccess)
         {
             var validation = ValidateCommandState(SteamNetworkingState.InLobby);
             if (!validation.Accepted)
@@ -303,7 +343,8 @@ namespace DingoSteamNetworking
                     sendFlags,
                     channel);
 
-                if (sendResult == EResult.k_EResultNoConnection)
+                if (sendResult == EResult.k_EResultNoConnection
+                    && allowSessionRestart)
                 {
                     sendResult = SteamNetworkingMessages.SendMessageToUser(
                         ref identity,
@@ -314,7 +355,9 @@ namespace DingoSteamNetworking
                         channel);
                 }
 
-                if (sendResult == EResult.k_EResultOK)
+                if (sendResult == EResult.k_EResultOK
+                    || (ignoredIsSuccess
+                        && sendResult == EResult.k_EResultIgnored))
                     return new SteamPeerSendResult(peerId, true, null);
 
                 return FailedPeerSend(
@@ -375,7 +418,10 @@ namespace DingoSteamNetworking
                         channel,
                         messageKind,
                         payload,
-                        sendFlags));
+                        sendFlags,
+                        allowSessionRestart: true,
+                        ignoredIsSuccess: sendFlags
+                            == Constants.k_nSteamNetworkingSend_UnreliableNoDelay));
                 }
             }
 
@@ -549,10 +595,13 @@ namespace DingoSteamNetworking
                 return;
 
             ClosePeerSession(peerId);
-            PublishError(
+            var error = new SteamNetworkingError(
                 SteamNetworkingErrorCode.TransportFailure,
-                $"Steam session with {peerId} failed ({callback.m_info.m_eEndReason}): "
+                $"Steam session with {peerId} failed "
+                + $"({callback.m_info.m_eEndReason}): "
                 + callback.m_info.m_szEndDebug);
+            PeerSessionFailed?.Invoke(peerId, error);
+            PublishError(error.Code, error.Message);
         }
 
         private bool WriteLobbyMetadata(CSteamID lobbyId)
@@ -793,7 +842,6 @@ namespace DingoSteamNetworking
             string message)
         {
             var error = new SteamNetworkingError(code, message);
-            ErrorRaised?.Invoke(error);
             return new SteamPeerSendResult(peerId, false, error);
         }
 
