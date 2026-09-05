@@ -11,10 +11,16 @@ namespace DingoSteamNetworking
         public const string LOBBY_PRODUCT_KEY = "dingo.product";
         public const string LOBBY_PROTOCOL_KEY = "dingo.protocol";
         public const string LOBBY_BUILD_KEY = "dingo.build";
+        public const string LOBBY_NAME_KEY = "dingo.name";
+        public const string LOBBY_STATUS_KEY = "dingo.status";
+        public const string LOBBY_VISIBILITY_KEY = "dingo.visibility";
 
         private static SteamNetworkingClient _lifecycleOwner;
 
         private readonly SteamLobbyMembership _membership = new();
+        private readonly HashSet<SteamPeerId> _pendingSessionRequests = new();
+        private readonly Dictionary<SteamPeerId, double> _pendingSessionCloses = new();
+        private const double SESSION_CLOSE_GRACE_SECONDS = 2;
 
         private SteamNetworkingConfiguration _configuration;
         private int _mainThreadId;
@@ -30,8 +36,12 @@ namespace DingoSteamNetworking
         private Callback<PersonaStateChange_t> _personaStateChangeCallback;
         private Callback<SteamNetworkingMessagesSessionRequest_t> _sessionRequestCallback;
         private Callback<SteamNetworkingMessagesSessionFailed_t> _sessionFailedCallback;
-        private CallResult<LobbyCreated_t> _createLobbyCallResult;
-        private CallResult<LobbyEnter_t> _joinLobbyCallResult;
+        private readonly Dictionary<ulong, IDisposable> _lobbyOperations = new();
+        private readonly SteamLobbyOperation _lobbyOperation = new();
+        private CallResult<LobbyMatchList_t> _lobbyListCallResult;
+        public SteamLobbyBrowserSnapshot LobbyBrowser { get; private set; } =
+            new(false, false, Array.Empty<SteamLobbyListing>());
+        public event Action<SteamLobbyBrowserSnapshot> LobbyBrowserChanged;
 
         public SteamNetworkingState State { get; private set; } = SteamNetworkingState.Uninitialized;
         public SteamPeer LocalPeer { get; private set; }
@@ -115,17 +125,25 @@ namespace DingoSteamNetworking
             EnsureInitializedOnMainThread();
             SteamAPI.RunCallbacks();
             ReceiveMessages();
+            ProcessPendingSessionCloses(UnityEngine.Time.realtimeSinceStartupAsDouble);
         }
 
-        public SteamCommandResult CreateFriendsOnlyLobby()
+        public SteamCommandResult CreateFriendsOnlyLobby() =>
+            CreateLobby(ELobbyType.k_ELobbyTypeFriendsOnly);
+
+        public SteamCommandResult CreatePublicLobby() =>
+            CreateLobby(ELobbyType.k_ELobbyTypePublic);
+
+        private SteamCommandResult CreateLobby(ELobbyType type)
         {
             var validation = ValidateCommandState(SteamNetworkingState.Ready);
             if (!validation.Accepted)
                 return validation;
 
             SetState(SteamNetworkingState.CreatingLobby);
+            _pendingSessionCloses.Clear();
             var apiCall = SteamMatchmaking.CreateLobby(
-                ELobbyType.k_ELobbyTypeFriendsOnly,
+                type,
                 _configuration.LobbyMemberLimit);
             if (apiCall == SteamAPICall_t.Invalid)
             {
@@ -134,7 +152,19 @@ namespace DingoSteamNetworking
                     "Steam rejected the create-lobby request before dispatch.");
             }
 
-            _createLobbyCallResult.Set(apiCall);
+            var operationId = _lobbyOperation.Begin();
+            var result = CallResult<LobbyCreated_t>.Create((callback, failed) =>
+            {
+                CompleteLobbyOperation(operationId);
+                if (!_lobbyOperation.Complete(operationId))
+                {
+                    ReleaseCancelledLobby(callback.m_ulSteamIDLobby);
+                    return;
+                }
+                OnLobbyCreated(callback, failed, type);
+            });
+            _lobbyOperations.Add(operationId, result);
+            result.Set(apiCall);
             return SteamCommandResult.Success();
         }
 
@@ -151,6 +181,10 @@ namespace DingoSteamNetworking
             }
 
             SetState(SteamNetworkingState.JoiningLobby);
+            // A new lobby operation may reuse the same native peer session.
+            // Cleanup from the previous entry must not close it after the new join.
+            _pendingSessionCloses.Clear();
+            UnityEngine.Debug.Log($"[NETTRACE][SteamLobby] Join requested lobby={lobbyId}.");
             var apiCall = SteamMatchmaking.JoinLobby(new CSteamID(lobbyId.Value));
             if (apiCall == SteamAPICall_t.Invalid)
             {
@@ -159,7 +193,28 @@ namespace DingoSteamNetworking
                     "Steam rejected the join-lobby request before dispatch.");
             }
 
-            _joinLobbyCallResult.Set(apiCall);
+            var operationId = _lobbyOperation.Begin(lobbyId);
+            var result = CallResult<LobbyEnter_t>.Create((callback, failed) =>
+            {
+                CompleteLobbyOperation(operationId);
+                if (!_lobbyOperation.Complete(operationId))
+                {
+                    if (!failed && callback.m_EChatRoomEnterResponse ==
+                        (uint)EChatRoomEnterResponse.k_EChatRoomEnterResponseSuccess)
+                    {
+                        ReleaseCancelledLobby(callback.m_ulSteamIDLobby);
+                    }
+                    return;
+                }
+                if (failed || callback.m_EChatRoomEnterResponse !=
+                    (uint)EChatRoomEnterResponse.k_EChatRoomEnterResponseSuccess)
+                {
+                    ReleaseCancelledLobby(lobbyId.Value);
+                }
+                OnLobbyEntered(callback, failed);
+            });
+            _lobbyOperations.Add(operationId, result);
+            result.Set(apiCall);
             return SteamCommandResult.Success();
         }
 
@@ -193,6 +248,106 @@ namespace DingoSteamNetworking
 
             ClearActiveLobby(true, true);
             return SteamCommandResult.Success();
+        }
+
+        private void CompleteLobbyOperation(ulong operationId)
+        {
+            if (_lobbyOperations.Remove(operationId, out var operation))
+            {
+                operation.Dispose();
+            }
+        }
+
+        private void ReleaseCancelledLobby(ulong lobbyId)
+        {
+            if (_lobbyOperation.ShouldLeaveLateLobby(new SteamLobbyId(lobbyId),
+                new SteamLobbyId((ulong)_activeLobbyId)))
+            {
+                SteamMatchmaking.LeaveLobby(new CSteamID(lobbyId));
+            }
+        }
+
+        public SteamCommandResult RequestPublicLobbies()
+        {
+            var validation = ValidateCommandState(SteamNetworkingState.Ready);
+            if (!validation.Accepted)
+            {
+                return validation;
+            }
+            if (LobbyBrowser.IsSearching)
+            {
+                return SteamCommandResult.Success();
+            }
+            SteamMatchmaking.AddRequestLobbyListStringFilter(LOBBY_PRODUCT_KEY,
+                _configuration.ProductId, ELobbyComparison.k_ELobbyComparisonEqual);
+            SteamMatchmaking.AddRequestLobbyListStringFilter(LOBBY_PROTOCOL_KEY,
+                _configuration.ProtocolVersionText, ELobbyComparison.k_ELobbyComparisonEqual);
+            SteamMatchmaking.AddRequestLobbyListStringFilter(LOBBY_BUILD_KEY,
+                _configuration.BuildId, ELobbyComparison.k_ELobbyComparisonEqual);
+            SteamMatchmaking.AddRequestLobbyListStringFilter(LOBBY_VISIBILITY_KEY,
+                "public", ELobbyComparison.k_ELobbyComparisonEqual);
+            SteamMatchmaking.AddRequestLobbyListDistanceFilter(
+                ELobbyDistanceFilter.k_ELobbyDistanceFilterWorldwide);
+            SteamMatchmaking.AddRequestLobbyListResultCountFilter(50);
+            PublishLobbyBrowser(new SteamLobbyBrowserSnapshot(true, true, LobbyBrowser.Lobbies));
+            var call = SteamMatchmaking.RequestLobbyList();
+            if (call == SteamAPICall_t.Invalid)
+            {
+                PublishLobbyBrowser(new SteamLobbyBrowserSnapshot(false, true,
+                    LobbyBrowser.Lobbies, "Steam отклонил поиск. Попробуйте обновить список."));
+                return SteamCommandResult.Rejected(SteamNetworkingErrorCode.LobbyJoinFailed,
+                    LobbyBrowser.ErrorText);
+            }
+            _lobbyListCallResult.Set(call);
+            return SteamCommandResult.Success();
+        }
+
+        public SteamCommandResult SetLobbyAvailability(string status, bool joinable)
+        {
+            var validation = ValidateCommandState(SteamNetworkingState.InLobby);
+            if (!validation.Accepted)
+            {
+                return validation;
+            }
+            if (CurrentLobby.OwnerId != LocalPeer.Id
+                || !SteamMatchmaking.SetLobbyData(_activeLobbyId, LOBBY_STATUS_KEY, status)
+                || !SteamMatchmaking.SetLobbyJoinable(_activeLobbyId, joinable))
+            {
+                return SteamCommandResult.Rejected(SteamNetworkingErrorCode.LobbyMetadataFailed,
+                    "Не удалось обновить доступность lobby.");
+            }
+            return SteamCommandResult.Success();
+        }
+
+        private void OnLobbyList(LobbyMatchList_t callback, bool failed)
+        {
+            if (failed)
+            {
+                PublishLobbyBrowser(new SteamLobbyBrowserSnapshot(false, true,
+                    LobbyBrowser.Lobbies, "Не удалось получить лобби. Проверьте Steam и обновите список."));
+                return;
+            }
+            var lobbies = new List<SteamLobbyListing>();
+            for (var i = 0; i < callback.m_nLobbiesMatching; i++)
+            {
+                var lobby = SteamMatchmaking.GetLobbyByIndex(i);
+                if ((ulong)lobby == 0 || !IsLobbyCompatible(lobby, out _))
+                {
+                    continue;
+                }
+                lobbies.Add(new SteamLobbyListing(new SteamLobbyId((ulong)lobby),
+                    SteamMatchmaking.GetLobbyData(lobby, LOBBY_NAME_KEY),
+                    SteamMatchmaking.GetLobbyData(lobby, LOBBY_STATUS_KEY),
+                    SteamMatchmaking.GetNumLobbyMembers(lobby),
+                    SteamMatchmaking.GetLobbyMemberLimit(lobby)));
+            }
+            PublishLobbyBrowser(new SteamLobbyBrowserSnapshot(false, true, lobbies));
+        }
+
+        private void PublishLobbyBrowser(SteamLobbyBrowserSnapshot snapshot)
+        {
+            LobbyBrowser = snapshot;
+            LobbyBrowserChanged?.Invoke(snapshot);
         }
 
         public SteamCommandResult OpenInviteOverlay()
@@ -340,20 +495,10 @@ namespace DingoSteamNetworking
                     ref identity,
                     pinnedPacket.AddrOfPinnedObject(),
                     (uint)packet.Length,
-                    sendFlags,
+                    allowSessionRestart
+                        ? sendFlags | Constants.k_nSteamNetworkingSend_AutoRestartBrokenSession
+                        : sendFlags,
                     channel);
-
-                if (sendResult == EResult.k_EResultNoConnection
-                    && allowSessionRestart)
-                {
-                    sendResult = SteamNetworkingMessages.SendMessageToUser(
-                        ref identity,
-                        pinnedPacket.AddrOfPinnedObject(),
-                        (uint)packet.Length,
-                        sendFlags
-                        | Constants.k_nSteamNetworkingSend_AutoRestartBrokenSession,
-                        channel);
-                }
 
                 if (sendResult == EResult.k_EResultOK
                     || (ignoredIsSuccess
@@ -466,8 +611,7 @@ namespace DingoSteamNetworking
             _personaStateChangeCallback = Callback<PersonaStateChange_t>.Create(OnPersonaStateChanged);
             _sessionRequestCallback = Callback<SteamNetworkingMessagesSessionRequest_t>.Create(OnSessionRequested);
             _sessionFailedCallback = Callback<SteamNetworkingMessagesSessionFailed_t>.Create(OnSessionFailed);
-            _createLobbyCallResult = CallResult<LobbyCreated_t>.Create(OnLobbyCreated);
-            _joinLobbyCallResult = CallResult<LobbyEnter_t>.Create(OnLobbyEntered);
+            _lobbyListCallResult = CallResult<LobbyMatchList_t>.Create(OnLobbyList);
         }
 
         private void OnLobbyJoinRequested(GameLobbyJoinRequested_t callback)
@@ -477,7 +621,7 @@ namespace DingoSteamNetworking
                 LobbyJoinRequested?.Invoke(lobbyId);
         }
 
-        private void OnLobbyCreated(LobbyCreated_t callback, bool ioFailure)
+        private void OnLobbyCreated(LobbyCreated_t callback, bool ioFailure, ELobbyType type)
         {
             if (State != SteamNetworkingState.CreatingLobby)
                 return;
@@ -490,7 +634,11 @@ namespace DingoSteamNetworking
             }
 
             var lobbyId = new CSteamID(callback.m_ulSteamIDLobby);
-            if (!WriteLobbyMetadata(lobbyId))
+            if (!WriteLobbyMetadata(lobbyId)
+                || !SteamMatchmaking.SetLobbyData(lobbyId, LOBBY_NAME_KEY, LocalPeer.DisplayName)
+                || !SteamMatchmaking.SetLobbyData(lobbyId, LOBBY_STATUS_KEY, "lobby")
+                || !SteamMatchmaking.SetLobbyData(lobbyId, LOBBY_VISIBILITY_KEY,
+                    type == ELobbyType.k_ELobbyTypePublic ? "public" : "friends"))
             {
                 SteamMatchmaking.LeaveLobby(lobbyId);
                 FailLobbyOperation(
@@ -504,6 +652,7 @@ namespace DingoSteamNetworking
 
         private void OnLobbyEntered(LobbyEnter_t callback, bool ioFailure)
         {
+            UnityEngine.Debug.Log($"[NETTRACE][SteamLobby] Join completed lobby={callback.m_ulSteamIDLobby}, response={callback.m_EChatRoomEnterResponse}, ioFailure={ioFailure}, state={State}.");
             if (State != SteamNetworkingState.JoiningLobby)
                 return;
 
@@ -569,23 +718,62 @@ namespace DingoSteamNetworking
         private void OnPersonaStateChanged(PersonaStateChange_t callback)
         {
             var peerId = new SteamPeerId(callback.m_ulSteamID);
-            if (State == SteamNetworkingState.InLobby && _membership.Contains(peerId))
-                RefreshLobbySnapshot();
+            const EPersonaChange nameChanges = EPersonaChange.k_EPersonaChangeName
+                                              | EPersonaChange.k_EPersonaChangeNameFirstSet;
+            if (State != SteamNetworkingState.InLobby || !_membership.Contains(peerId)
+                || (callback.m_nChangeFlags & nameChanges) == 0)
+            {
+                return;
+            }
+
+            // Friend status/avatar callbacks are not lobby membership notifications.
+            // Rescanning the lobby here can remove a connected peer from a transient cache.
+            var isLocal = peerId == LocalPeer.Id;
+            var displayName = isLocal
+                ? SteamFriends.GetPersonaName()
+                : SteamFriends.GetFriendPersonaName(new CSteamID(peerId.Value));
+            if (_membership.UpdateDisplayName(peerId, displayName))
+            {
+                if (isLocal)
+                {
+                    LocalPeer = new SteamPeer(peerId, displayName, LocalPeer.IsOwner, true);
+                }
+                LobbyChanged?.Invoke(_membership.Snapshot);
+            }
         }
 
         private void OnSessionRequested(SteamNetworkingMessagesSessionRequest_t callback)
         {
-            var remoteIdentity = callback.m_identityRemote;
-            var peerId = new SteamPeerId(remoteIdentity.GetSteamID64());
+            var peerId = new SteamPeerId(callback.m_identityRemote.GetSteamID64());
+            if (State == SteamNetworkingState.JoiningLobby)
+            {
+                // The host can see our membership before our LobbyEnter callback arrives.
+                // Decide only after entry succeeds (or is cancelled), using its roster.
+                _pendingSessionRequests.Add(peerId);
+                UnityEngine.Debug.Log($"[NETTRACE][SteamSessions] Deferring session request from {peerId} until lobby entry completes.");
+                return;
+            }
+
+            ResolveSessionRequest(peerId);
+        }
+
+        private void ResolveSessionRequest(SteamPeerId peerId)
+        {
+            if (_pendingSessionCloses.ContainsKey(peerId) && State != SteamNetworkingState.InLobby)
+            {
+                return;
+            }
             if (State == SteamNetworkingState.InLobby
                 && peerId != LocalPeer.Id
                 && _membership.Contains(peerId))
             {
-                SteamNetworkingMessages.AcceptSessionWithUser(ref remoteIdentity);
+                UnityEngine.Debug.Log($"[NETTRACE][SteamSessions] Accepting session request from lobby member {peerId}.");
+                AcceptPeerSession(peerId);
                 return;
             }
 
-            SteamNetworkingMessages.CloseSessionWithUser(ref remoteIdentity);
+            UnityEngine.Debug.Log($"[NETTRACE][SteamSessions] Rejecting session request from {peerId}: state={State}, member={_membership.Contains(peerId)}.");
+            ClosePeerSession(peerId);
         }
 
         private void OnSessionFailed(SteamNetworkingMessagesSessionFailed_t callback)
@@ -594,6 +782,17 @@ namespace DingoSteamNetworking
             if (!_membership.Contains(peerId))
                 return;
 
+            // This callback may describe a previous connection to the same Steam ID.
+            // Never close a new connection, or report the old failure to its transport.
+            var state = GetPeerSessionState(peerId);
+            if (state != ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_ClosedByPeer
+                && state != ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_ProblemDetectedLocally)
+            {
+                UnityEngine.Debug.Log($"[NETTRACE][SteamSessions] Ignoring obsolete failure for {peerId}: current={state}, callbackReason={callback.m_info.m_eEndReason}.");
+                return;
+            }
+
+            UnityEngine.Debug.Log($"[NETTRACE][SteamSessions] Closing failed session with {peerId}: current={state}, callbackReason={callback.m_info.m_eEndReason}.");
             ClosePeerSession(peerId);
             var error = new SteamNetworkingError(
                 SteamNetworkingErrorCode.TransportFailure,
@@ -692,7 +891,7 @@ namespace DingoSteamNetworking
             for (var i = 0; i < departedPeers.Length; i++)
             {
                 if (departedPeers[i] != LocalPeer.Id)
-                    ClosePeerSession(departedPeers[i]);
+                    SchedulePeerSessionClose(departedPeers[i]);
             }
 
             if (publishChanges)
@@ -801,7 +1000,7 @@ namespace DingoSteamNetworking
             for (var i = 0; i < peers.Length; i++)
             {
                 if (LocalPeer == null || peers[i] != LocalPeer.Id)
-                    ClosePeerSession(peers[i]);
+                    SchedulePeerSessionClose(peers[i]);
             }
 
             if (notifySteam && (ulong)lobbyId != 0)
@@ -813,8 +1012,64 @@ namespace DingoSteamNetworking
                 SetState(SteamNetworkingState.Ready);
         }
 
-        private void ClosePeerSession(SteamPeerId peerId)
+        private void SchedulePeerSessionClose(SteamPeerId peerId)
         {
+            // CloseSessionWithUser discards reliable sends that have not been delivered.
+            // Let a final Disconnect drain without blocking the menu or the Steam pump.
+            _pendingSessionCloses[peerId] = UnityEngine.Time.realtimeSinceStartupAsDouble
+                + SESSION_CLOSE_GRACE_SECONDS;
+        }
+
+        private void ProcessPendingSessionCloses(double now)
+        {
+            if (_pendingSessionCloses.Count == 0)
+            {
+                return;
+            }
+            foreach (var peerId in new List<SteamPeerId>(_pendingSessionCloses.Keys))
+            {
+                if (_membership.Contains(peerId))
+                {
+                    _pendingSessionCloses.Remove(peerId);
+                    continue;
+                }
+                if (now < _pendingSessionCloses[peerId] && HasPendingReliableMessages(peerId))
+                {
+                    continue;
+                }
+                _pendingSessionCloses.Remove(peerId);
+                ClosePeerSession(peerId);
+            }
+        }
+
+        protected virtual bool HasPendingReliableMessages(SteamPeerId peerId)
+        {
+            var identity = new SteamNetworkingIdentity();
+            identity.SetSteamID(new CSteamID(peerId.Value));
+            var state = SteamNetworkingMessages.GetSessionConnectionInfo(ref identity, out _, out var status);
+            return (state == ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_Connected
+                    || state == ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_Connecting
+                    || state == ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_FindingRoute)
+                   && (status.m_cbPendingReliable > 0 || status.m_cbSentUnackedReliable > 0);
+        }
+
+        protected virtual ESteamNetworkingConnectionState GetPeerSessionState(SteamPeerId peerId)
+        {
+            var identity = new SteamNetworkingIdentity();
+            identity.SetSteamID(new CSteamID(peerId.Value));
+            return SteamNetworkingMessages.GetSessionConnectionInfo(ref identity, out _, out _);
+        }
+
+        protected virtual void AcceptPeerSession(SteamPeerId peerId)
+        {
+            var identity = new SteamNetworkingIdentity();
+            identity.SetSteamID(new CSteamID(peerId.Value));
+            SteamNetworkingMessages.AcceptSessionWithUser(ref identity);
+        }
+
+        protected virtual void ClosePeerSession(SteamPeerId peerId)
+        {
+            _pendingSessionCloses.Remove(peerId);
             if (!peerId.IsValid || !_steamInitialized)
                 return;
 
@@ -825,8 +1080,9 @@ namespace DingoSteamNetworking
 
         private void CancelPendingLobbyOperation()
         {
-            _createLobbyCallResult?.Cancel();
-            _joinLobbyCallResult?.Cancel();
+            // Cancelling a CallResult does not cancel the Steam operation.
+            // Keep each callback alive so a late successful entry can be left.
+            _lobbyOperation.Cancel();
         }
 
         private SteamCommandResult FailLobbyOperation(SteamNetworkingErrorCode code, string message)
@@ -900,6 +1156,16 @@ namespace DingoSteamNetworking
                 return;
 
             State = state;
+            if (state != SteamNetworkingState.JoiningLobby && _pendingSessionRequests.Count > 0)
+            {
+                var peers = new SteamPeerId[_pendingSessionRequests.Count];
+                _pendingSessionRequests.CopyTo(peers);
+                _pendingSessionRequests.Clear();
+                foreach (var peerId in peers)
+                {
+                    ResolveSessionRequest(peerId);
+                }
+            }
             StateChanged?.Invoke(State);
         }
 
@@ -910,8 +1176,13 @@ namespace DingoSteamNetworking
 
         private void DisposeSteamResources()
         {
-            _createLobbyCallResult?.Dispose();
-            _joinLobbyCallResult?.Dispose();
+            _pendingSessionCloses.Clear();
+            foreach (var operation in _lobbyOperations.Values)
+            {
+                operation.Dispose();
+            }
+            _lobbyOperations.Clear();
+            _lobbyListCallResult?.Dispose();
             _joinRequestedCallback?.Dispose();
             _lobbyChatUpdateCallback?.Dispose();
             _lobbyDataUpdateCallback?.Dispose();
@@ -920,8 +1191,7 @@ namespace DingoSteamNetworking
             _sessionRequestCallback?.Dispose();
             _sessionFailedCallback?.Dispose();
 
-            _createLobbyCallResult = null;
-            _joinLobbyCallResult = null;
+            _lobbyListCallResult = null;
             _joinRequestedCallback = null;
             _lobbyChatUpdateCallback = null;
             _lobbyDataUpdateCallback = null;

@@ -16,6 +16,29 @@ namespace DingoSteamNetworking
             return _members.ContainsKey(peerId);
         }
 
+        public bool UpdateDisplayName(SteamPeerId peerId, string displayName)
+        {
+            displayName ??= string.Empty;
+            if (!_members.TryGetValue(peerId, out var previous)
+                || string.Equals(previous.DisplayName, displayName, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var updated = new SteamPeer(peerId, displayName, previous.IsOwner, previous.IsLocal);
+            var members = new SteamPeer[Snapshot.Members.Count];
+            for (var i = 0; i < members.Length; i++)
+            {
+                var member = Snapshot.Members[i];
+                members[i] = member.Id == peerId ? updated : member;
+            }
+
+            // Persona metadata must not change membership, ordering or lobby ownership.
+            _members[peerId] = updated;
+            Snapshot = new SteamLobbySnapshot(Snapshot.LobbyId, Snapshot.OwnerId, members);
+            return true;
+        }
+
         public SteamPeerId[] Replace(
             SteamLobbyId lobbyId,
             SteamPeerId ownerId,

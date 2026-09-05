@@ -14,6 +14,17 @@ or UI.
 Steam Lobby is used for membership, owner, metadata and invites. Application
 payloads use `SendReliable` or `BroadcastReliable`; lobby chat is not used.
 Incoming sessions and packets are accepted only from the active lobby roster.
+Requests received while joining wait for the confirmed roster; cancellation
+closes them. A session-failure callback is checked against the current native
+connection state before it can close a session or notify transport consumers.
+This prevents a delayed failure from terminating a later connection to the same
+Steam ID. Handshake/control callers may allow Steam's broken-session restart;
+established reliable gameplay streams must keep restart disabled.
+On lobby departure, native peer closure allows outstanding reliable messages
+to drain for up to two seconds. This runs in the existing Tick, without blocking
+the UI. New lobby operations cancel these old closures; reappearing members
+also invalidate their queued closure. Stop application transports before leaving
+the lobby so their final Disconnect can still be sent to its members.
 
 ## Dependency
 
