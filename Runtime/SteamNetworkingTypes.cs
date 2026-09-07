@@ -30,7 +30,8 @@ namespace DingoSteamNetworking
         PeerNotInLobby,
         InvalidPayload,
         ProtocolViolation,
-        TransportFailure
+        TransportFailure,
+        SendBufferFull
     }
 
     public readonly struct SteamPeerId : IEquatable<SteamPeerId>

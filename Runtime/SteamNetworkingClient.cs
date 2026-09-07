@@ -507,7 +507,9 @@ namespace DingoSteamNetworking
 
                 return FailedPeerSend(
                     peerId,
-                    SteamNetworkingErrorCode.TransportFailure,
+                    sendResult == EResult.k_EResultLimitExceeded
+                        ? SteamNetworkingErrorCode.SendBufferFull
+                        : SteamNetworkingErrorCode.TransportFailure,
                     $"Steam failed to send to {peerId}: {sendResult}.");
             }
             finally
