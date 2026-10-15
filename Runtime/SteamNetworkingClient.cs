@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Steamworks;
+using UnityEngine;
 
 namespace DingoSteamNetworking
 {
@@ -28,6 +29,8 @@ namespace DingoSteamNetworking
         private CSteamID _activeLobbyId;
         private IntPtr[][] _receivePointerBuffers;
         private int _nextReceiveChannelIndex;
+        private uint _receiveGeneration;
+        private bool _receivingMessages;
 
         private Callback<GameLobbyJoinRequested_t> _joinRequestedCallback;
         private Callback<LobbyChatUpdate_t> _lobbyChatUpdateCallback;
@@ -577,6 +580,7 @@ namespace DingoSteamNetworking
 
         public void Shutdown()
         {
+            _receiveGeneration++;
             if (!_steamInitialized)
             {
                 if (_lifecycleOwner == this)
@@ -904,14 +908,31 @@ namespace DingoSteamNetworking
 
         private void ReceiveMessages()
         {
-            if (State != SteamNetworkingState.InLobby)
+            if (State != SteamNetworkingState.InLobby || _receivingMessages)
                 return;
 
+            _receivingMessages = true;
+            try
+            {
+                ReceiveCurrentMessages();
+            }
+            finally
+            {
+                _receivingMessages = false;
+            }
+        }
+
+        private void ReceiveCurrentMessages()
+        {
+            var generation = _receiveGeneration;
             var channels = _configuration.MessageChannels;
             var startIndex = _nextReceiveChannelIndex % channels.Count;
             var remaining = _configuration.MaxMessagesPerTick;
             for (var offset = 0; offset < channels.Count && remaining > 0; offset++)
             {
+                if (State != SteamNetworkingState.InLobby || generation != _receiveGeneration)
+                    return;
+
                 var channelIndex = (startIndex + offset) % channels.Count;
                 var channel = channels[channelIndex];
                 var receivePointers = GetReceivePointerBuffer(remaining);
@@ -919,25 +940,67 @@ namespace DingoSteamNetworking
                     channel,
                     receivePointers,
                     receivePointers.Length);
+                ProcessReceivedBatch(channel, receivePointers, receivedCount);
+                remaining -= receivedCount;
+            }
+
+            if (State == SteamNetworkingState.InLobby && generation == _receiveGeneration)
+                _nextReceiveChannelIndex = (startIndex + 1) % channels.Count;
+        }
+
+        // The captured batch owns every native message, even when delivery retires this lobby.
+        protected void ProcessReceivedBatch(int channel, IntPtr[] receivePointers, int receivedCount)
+        {
+            var generation = _receiveGeneration;
+            try
+            {
                 for (var i = 0; i < receivedCount; i++)
                 {
+                    if (State != SteamNetworkingState.InLobby || generation != _receiveGeneration)
+                        return;
+
                     var messagePointer = receivePointers[i];
                     try
                     {
                         ReceiveMessage(channel, messagePointer);
                     }
+                    catch (Exception error)
+                    {
+                        Debug.LogException(error);
+                    }
                     finally
                     {
-                        SteamNetworkingMessage_t.Release(messagePointer);
-                        receivePointers[i] = IntPtr.Zero;
+                        ReleaseReceivedMessage(receivePointers, i);
                     }
                 }
-
-                remaining -= receivedCount;
             }
-
-            _nextReceiveChannelIndex = (startIndex + 1) % channels.Count;
+            finally
+            {
+                for (var i = 0; i < receivedCount; i++)
+                {
+                    ReleaseReceivedMessage(receivePointers, i);
+                }
+            }
         }
+
+        private void ReleaseReceivedMessage(IntPtr[] receivePointers, int index)
+        {
+            var messagePointer = receivePointers[index];
+            if (messagePointer == IntPtr.Zero)
+                return;
+
+            receivePointers[index] = IntPtr.Zero;
+            try
+            {
+                ReleaseNativeMessage(messagePointer);
+            }
+            catch (Exception error)
+            {
+                Debug.LogException(error);
+            }
+        }
+
+        protected virtual void ReleaseNativeMessage(IntPtr messagePointer) => SteamNetworkingMessage_t.Release(messagePointer);
 
         private IntPtr[] GetReceivePointerBuffer(int capacity)
         {
@@ -950,7 +1013,7 @@ namespace DingoSteamNetworking
             return buffer;
         }
 
-        private void ReceiveMessage(int channel, IntPtr messagePointer)
+        protected virtual void ReceiveMessage(int channel, IntPtr messagePointer)
         {
             var message = SteamNetworkingMessage_t.FromIntPtr(messagePointer);
             var senderId = new SteamPeerId(message.m_identityPeer.GetSteamID64());
@@ -994,6 +1057,7 @@ namespace DingoSteamNetworking
 
         private void ClearActiveLobby(bool notifySteam, bool setReadyState)
         {
+            _receiveGeneration++;
             var hadLobby = (ulong)_activeLobbyId != 0 || _membership.HasLobby;
             var lobbyId = _activeLobbyId;
             _activeLobbyId = default;

@@ -3,13 +3,89 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using NUnit.Framework;
 using Steamworks;
+using UnityEngine;
+using UnityEngine.TestTools;
 
 namespace DingoSteamNetworking.Tests.Editor
 {
     public class SteamNetworkingCoreTests
     {
+        [Test]
+        public void ReceiveBatch_HandlerFailureReleasesEveryMessageAndPreservesLaterDelivery()
+        {
+            var client = new ScriptedSteamReceiveClient();
+            client.SetTestLobby(true);
+            client.ChangeState(SteamNetworkingState.InLobby);
+            var messages = new[] { new IntPtr(1), new IntPtr(2), new IntPtr(3) };
+            client.OnReceive = pointer =>
+            {
+                if (pointer == new IntPtr(1))
+                    throw new InvalidOperationException("scripted receive failure");
+            };
+            LogAssert.Expect(LogType.Exception, new Regex("scripted receive failure"));
+
+            client.DeliverBatch(messages);
+
+            Assert.That(client.Received, Is.EqualTo(new[] { new IntPtr(1), new IntPtr(2), new IntPtr(3) }));
+            Assert.That(client.Released, Is.EqualTo(client.Received));
+            Assert.That(messages, Is.EqualTo(new[] { IntPtr.Zero, IntPtr.Zero, IntPtr.Zero }));
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ReceiveBatch_ShutdownCancelsOldDeliveryAndReleasesTheCapturedBatch(bool reenter)
+        {
+            var client = new ScriptedSteamReceiveClient();
+            client.SetTestLobby(true);
+            client.ChangeState(SteamNetworkingState.InLobby);
+            var messages = new[] { new IntPtr(1), new IntPtr(2), new IntPtr(3) };
+            client.OnReceive = _ =>
+            {
+                client.Shutdown();
+                if (reenter)
+                {
+                    client.SetTestLobby(true);
+                    client.ChangeState(SteamNetworkingState.InLobby);
+                }
+            };
+
+            client.DeliverBatch(messages);
+
+            Assert.That(client.Received, Is.EqualTo(new[] { new IntPtr(1) }));
+            Assert.That(client.Released, Is.EqualTo(new[] { new IntPtr(1), new IntPtr(2), new IntPtr(3) }));
+            Assert.That(messages, Is.EqualTo(new[] { IntPtr.Zero, IntPtr.Zero, IntPtr.Zero }));
+        }
+
+        [Test]
+        public void ReceiveBatch_ReceiveAndReleaseFailuresAreBothReportedWithoutAbandoningOwnership()
+        {
+            var client = new ScriptedSteamReceiveClient();
+            client.SetTestLobby(true);
+            client.ChangeState(SteamNetworkingState.InLobby);
+            var messages = new[] { new IntPtr(1), new IntPtr(2) };
+            client.OnReceive = pointer =>
+            {
+                if (pointer == new IntPtr(1))
+                    throw new InvalidOperationException("scripted receive failure");
+            };
+            client.OnRelease = pointer =>
+            {
+                if (pointer == new IntPtr(1))
+                    throw new InvalidOperationException("scripted release failure");
+            };
+            LogAssert.Expect(LogType.Exception, new Regex("scripted receive failure"));
+            LogAssert.Expect(LogType.Exception, new Regex("scripted release failure"));
+
+            client.DeliverBatch(messages);
+
+            Assert.That(client.Received, Is.EqualTo(new[] { new IntPtr(1), new IntPtr(2) }));
+            Assert.That(client.Released, Is.EqualTo(client.Received));
+            Assert.That(messages, Is.EqualTo(new[] { IntPtr.Zero, IntPtr.Zero }));
+        }
+
         [Test]
         public void Configuration_ValidValues_ArePreserved()
         {
@@ -433,6 +509,28 @@ namespace DingoSteamNetworking.Tests.Editor
                 out _,
                 out _,
                 out _);
+        }
+    }
+
+    public class ScriptedSteamReceiveClient : ScriptedSteamSessionClient
+    {
+        public readonly List<IntPtr> Received = new();
+        public readonly List<IntPtr> Released = new();
+        public Action<IntPtr> OnReceive;
+        public Action<IntPtr> OnRelease;
+
+        public void DeliverBatch(IntPtr[] messages) => ProcessReceivedBatch(0, messages, messages.Length);
+
+        protected override void ReceiveMessage(int channel, IntPtr pointer)
+        {
+            Received.Add(pointer);
+            OnReceive?.Invoke(pointer);
+        }
+
+        protected override void ReleaseNativeMessage(IntPtr pointer)
+        {
+            Released.Add(pointer);
+            OnRelease?.Invoke(pointer);
         }
     }
 

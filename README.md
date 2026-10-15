@@ -26,6 +26,12 @@ the UI. New lobby operations cancel these old closures; reappearing members
 also invalidate their queued closure. Stop application transports before leaving
 the lobby so their final Disconnect can still be sent to its members.
 
+The receive pump owns every native message returned in a batch. A delivery or
+release exception is logged without abandoning the remaining messages. Delivery
+continues only for the captured lobby generation; shutdown or lobby retirement
+stops delivery and releases the remainder of that captured batch. Nested receive
+pumps cannot overwrite its owned pointer buffer.
+
 ## Dependency
 
 The host Unity project must reference Steamworks.NET commit
